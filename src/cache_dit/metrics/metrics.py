@@ -22,7 +22,7 @@ compute_fid = _safe_import(".fid", "compute_fid")
 compute_video_fid = _safe_import(".fid", "compute_video_fid")
 compute_lpips_img = _safe_import(".metrics", "compute_lpips_img")
 compute_clip_score = _safe_import(".clip_score", "compute_clip_score")
-compute_reward_score_img = _safe_import(".image_reward", "compute_reward_score_img")
+compute_reward_score = _safe_import(".image_reward", "compute_reward_score")
 
 logger = init_logger(__name__)
 
