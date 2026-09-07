@@ -2,7 +2,6 @@ import inspect
 import logging
 import torch
 import torch.distributed as dist
-from diffusers.hooks import HookRegistry
 from ..cache_contexts.cache_context import CachedContext
 from ..cache_contexts.prune_context import PrunedContext
 from ..cache_contexts.cache_manager import (
@@ -24,6 +23,14 @@ except ImportError:
   logger.debug("Context parallelism in cache-dit requires 'diffusers>=0.36.dev0.\n"
                "Please install latest version of diffusers from source via: \n"
                "pip3 install git+https://github.com/huggingface/diffusers.git")
+
+try:
+  from ...distributed.core._context_parallel import (
+    _ContextParallelSplitHook as _CacheDiTContextParallelSplitHook, )
+except ImportError:
+  _CacheDiTContextParallelSplitHook = None
+  logger.debug("cache-dit context parallelism hooks are unavailable; the "
+               "cache residual will not be sharded under context parallelism.")
 
 
 class CachedBlocks_Pattern_Base(torch.nn.Module):
@@ -159,41 +166,74 @@ class CachedBlocks_Pattern_Base(torch.nn.Module):
              (encoder_hidden_states, hidden_states)))
 
   @torch.compiler.disable
+  def _iter_cp_split_hooks(self, module: torch.nn.Module):
+    # Yield context-parallel split hooks from both diffusers' native registry
+    # (`_diffusers_hook`) and cache-dit's own CP runtime registry (`_cache_dit_hook`).
+    if hasattr(module, "_diffusers_hook"):
+      for hook in module._diffusers_hook.hooks.values():
+        if ContextParallelSplitHook is not None and isinstance(hook, ContextParallelSplitHook):
+          yield hook
+    if _CacheDiTContextParallelSplitHook is not None:
+      registry = getattr(module, "_cache_dit_hook", None)
+      if registry is not None:
+        for hook in registry.hooks.values():
+          if isinstance(hook, _CacheDiTContextParallelSplitHook):
+            yield hook
+
+  @torch.compiler.disable
   def _check_if_context_parallel_enabled(
     self,
     module: torch.nn.Module,
   ) -> bool:
-    if ContextParallelSplitHook is None:
-      return False
-    if hasattr(module, "_diffusers_hook"):
-      _diffusers_hook: HookRegistry = module._diffusers_hook
-      for hook in _diffusers_hook.hooks.values():
-        if isinstance(hook, ContextParallelSplitHook):
-          return True
-    return False
+    return next(self._iter_cp_split_hooks(module), None) is not None
+
+  @torch.compiler.disable
+  def _shard_with_cp_split_hook(
+    self,
+    hook,
+    hidden_states: torch.Tensor,
+    target_shape: torch.Size,
+  ) -> torch.Tensor | None:
+    # Replay the block's own CP split on the full-sequence tensor so the Fn residual
+    # compares two equally-sharded states; both hook runtimes expose `metadata` and
+    # `_prepare_cp_input` with the same contract.
+    metadata = getattr(hook, "metadata", None)
+    if not metadata:
+      return None
+    for cpm in metadata.values():
+      if not hasattr(cpm, "split_dim") or getattr(cpm, "split_output", False):
+        continue
+      sharded = hook._prepare_cp_input(hidden_states, cpm)
+      if sharded is not None and sharded.shape == target_shape:
+        return sharded
+    return None
 
   def _get_Fn_residual(
     self,
     original_hidden_states: torch.Tensor,
     hidden_states: torch.Tensor,
   ) -> torch.Tensor:
-    # NOTE: Make cases compatible with context parallelism while using
-    # block level cp plan, e.g., WanTransformer3DModel. The shape of
-    # `original_hidden_states` and `hidden_states` after Fn maybe
-    # different due to seqlen split in context parallelism.
-    if self._check_if_context_parallel_enabled(
-        self.transformer_blocks[0]) and (original_hidden_states.shape != hidden_states.shape):
-      # Force use `hidden_states` as the Fn states residual for subsequent
-      # dynamic cache processing if the shape is different.
-      Fn_hidden_states_residual = hidden_states
+    # NOTE: context parallelism (ulysses/ring) splits the sequence inside the first Fn
+    # block, so the wrapper-level `original_hidden_states` stays full-length while
+    # `hidden_states` is already sharded. Shard the original with that same CP hook
+    # before subtracting; fall back to using `hidden_states` when no split hook matches.
+    cp_split_hook = next(self._iter_cp_split_hooks(self.transformer_blocks[0]), None)
+    if cp_split_hook is not None and original_hidden_states.shape != hidden_states.shape:
+      sharded_original = self._shard_with_cp_split_hook(
+        cp_split_hook,
+        original_hidden_states,
+        hidden_states.shape,
+      )
+      if sharded_original is not None and sharded_original.shape == hidden_states.shape:
+        return hidden_states - sharded_original.to(hidden_states.device)
       if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"Context parallelism is enabled in Fn blocks, and the shape of "
                      f"original_hidden_states {original_hidden_states.shape} and "
-                     f"hidden_states {hidden_states.shape} are different after Fn blocks. "
-                     f"Use hidden_states as Fn_hidden_states_residual directly.")
-    else:
-      Fn_hidden_states_residual = hidden_states - original_hidden_states.to(hidden_states.device)
-    return Fn_hidden_states_residual
+                     f"hidden_states {hidden_states.shape} are different after Fn blocks, "
+                     f"but no matching CP split hook was found. Use hidden_states as "
+                     f"Fn_hidden_states_residual directly.")
+      return hidden_states
+    return hidden_states - original_hidden_states.to(hidden_states.device)
 
   def forward(
     self,
